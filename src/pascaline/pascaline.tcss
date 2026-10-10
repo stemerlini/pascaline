@@ -1,0 +1,150 @@
+Screen {
+    background: $background;
+}
+
+#sheet {
+    height: 1fr;
+    padding: 1 1 0 1;
+    scrollbar-size-vertical: 1;
+    scrollbar-background: $background;
+    scrollbar-color: $panel-lighten-2;
+}
+
+#welcome {
+    color: $text-muted;
+    padding: 0 1;
+}
+
+Cell {
+    height: auto;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+    margin-bottom: 1;
+    border-left: blank;
+}
+
+Cell.-selected {
+    background: $boost;
+    border-left: outer $primary;
+}
+
+#sheet:focus Cell.-selected {
+    background: $primary 15%;
+}
+
+#main {
+    height: 1fr;
+}
+
+#left {
+    width: 1fr;
+}
+
+#graph {
+    height: 1fr;
+    width: 60;
+    border: round $panel-lighten-2;
+    border-title-color: $text-muted;
+    padding: 0 1;
+    text-wrap: nowrap;
+}
+
+#bottom {
+    height: auto;
+    dock: bottom;
+    border-top: solid $panel-lighten-1;
+}
+
+#menu {
+    height: auto;
+    max-height: 8;
+    border: none;
+    padding: 0 1;
+    background: $surface;
+    scrollbar-size-vertical: 1;
+}
+
+#menu > .option-list--option-highlighted {
+    background: $primary 25%;
+}
+
+#prompt-row {
+    height: 1;
+    padding: 0 1;
+}
+
+#prompt {
+    width: 2;
+    color: $primary;
+    text-style: bold;
+}
+
+MathInput {
+    border: none;
+    height: 1;
+    padding: 0;
+    background: transparent;
+}
+
+MathInput:focus {
+    border: none;
+    background: transparent;
+}
+
+MathInput.-editing {
+    background: $warning 12%;
+}
+
+MathInput > .input--suggestion {
+    color: $text-disabled;
+}
+
+#preview {
+    height: auto;
+    max-height: 3;
+    padding: 0 1;
+    min-height: 1;
+}
+
+#status {
+    height: 1;
+    background: $panel;
+    color: $text-muted;
+}
+
+HistoryScreen, HelpScreen {
+    align: center middle;
+    background: $background 60%;
+}
+
+#history-box {
+    width: 90%;
+    height: 80%;
+    border: round $primary;
+    background: $surface;
+    padding: 0 1;
+}
+
+#history-filter {
+    border: none;
+    height: 1;
+    padding: 0;
+    margin-bottom: 1;
+    background: transparent;
+}
+
+#history-list {
+    border: none;
+    background: transparent;
+    height: 1fr;
+}
+
+#help-box {
+    width: auto;
+    max-width: 96%;
+    height: auto;
+    max-height: 96%;
+    border: round $primary;
+    background: $surface;
+    padding: 0 2;
+}

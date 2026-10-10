@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Install Pascaline into Omarchy: `pascaline` command, apps-menu entry, a floating
+# window rule and the calculator shortcut (SUPER + CTRL + Q and the
+# Calculator media key, taking them over from omacalc). Safe to run again.
+# Undo with tools/uninstall-omarchy.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+BIN="$HOME/.local/bin/pascaline"
+DESKTOP="$HOME/.local/share/applications/pascaline.desktop"
+HYPR="$HOME/.config/hypr"
+WIDTH="${PASCALINE_WIDTH:-900}"  # window size in pixels; override and rerun to change
+HEIGHT="${PASCALINE_HEIGHT:-440}"
+LAUNCH="omarchy-launch-or-focus-tui --app-id=org.omarchy.pascaline $BIN"
+BEGIN="-- >>> pascaline (managed by $ROOT/tools/install-omarchy)"
+END="-- <<< pascaline"
+
+step() { printf '\e[1;32m›\e[0m %s\n' "$*"; }
+
+# Replace (or add) the marked block in a Lua file, keeping a backup once.
+put_block() {
+  local file="$1" body="$2"
+  [[ -f $file.bak-pascaline ]] || cp "$file" "$file.bak-pascaline"
+  sed -i "/^-- >>> pascaline /,/^-- <<< pascaline$/d" "$file"
+  sed -i -e ':a' -e '/^\n*$/{$d;N;ba' -e '}' "$file"  # no trailing blank lines
+  printf '\n%s\n%s\n%s\n' "$BEGIN" "$body" "$END" >>"$file"
+}
+
+# 1. Python environment
+if [[ ! -x $ROOT/.venv/bin/pascaline ]]; then
+  step "Creating the Python environment"
+  python3 -m venv "$ROOT/.venv"
+  "$ROOT/.venv/bin/pip" install -q -e "$ROOT"
+fi
+
+# 2. Command on PATH
+if [[ -e $BIN && ! -L $BIN ]]; then
+  echo "$BIN exists and is not a link; move it away and run again." >&2
+  exit 1
+fi
+mkdir -p "$(dirname "$BIN")"
+ln -sfn "$ROOT/pascaline" "$BIN"
+step "Command: $BIN → $ROOT/pascaline"
+
+# 3. Apps-menu entry
+mkdir -p "$(dirname "$DESKTOP")"
+cat >"$DESKTOP" <<DESKTOP
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Pascaline
+GenericName=Calculator
+Comment=Notebook-style scientific calculator
+Exec=$LAUNCH
+Icon=accessories-calculator
+Terminal=false
+Categories=Utility;Calculator;
+Keywords=calculator;math;calc;sympy;notebook;
+StartupNotify=true
+DESKTOP
+step "Apps menu: Pascaline"
+
+# 4. Floating window + shortcut
+# Wide, so the commands pane and the square graph pane sit side by side.
+put_block "$HYPR/hyprland.lua" "o.window(\"org.omarchy.pascaline\", { float = true })
+o.window(\"org.omarchy.pascaline\", { center = true })
+o.window(\"org.omarchy.pascaline\", { size = { $WIDTH, $HEIGHT } })"
+put_block "$HYPR/bindings.lua" "hl.unbind(\"SUPER + CTRL + Q\")
+hl.unbind(\"XF86Calculator\")
+o.bind(\"SUPER + CTRL + Q\", \"Pascaline calculator\", \"$LAUNCH\")
+o.bind(\"XF86Calculator\", \"Pascaline calculator\", \"$LAUNCH\")"
+if command -v hyprctl >/dev/null && hyprctl reload >/dev/null 2>&1; then
+  errors="$(hyprctl configerrors 2>/dev/null || true)"
+  if [[ -n ${errors//[[:space:]]/} && $errors != *"no errors"* ]]; then
+    printf '%s\n' "$errors" >&2
+    exit 1
+  fi
+fi
+step "Shortcut: SUPER + CTRL + Q (and the Calculator key) opens Pascaline"

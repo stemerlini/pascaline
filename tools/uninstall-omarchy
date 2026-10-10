@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Remove what tools/install-omarchy added. The project folder is left alone.
+set -euo pipefail
+
+HYPR="$HOME/.config/hypr"
+[[ -L $HOME/.local/bin/pascaline ]] && rm "$HOME/.local/bin/pascaline"
+rm -f "$HOME/.local/share/applications/pascaline.desktop"
+for f in "$HYPR/hyprland.lua" "$HYPR/bindings.lua"; do
+  [[ -f $f ]] || continue
+  sed -i "/^-- >>> pascaline /,/^-- <<< pascaline$/d" "$f"
+  sed -i -e ':a' -e '/^\n*$/{$d;N;ba' -e '}' "$f"  # no trailing blank lines
+done
+command -v hyprctl >/dev/null && hyprctl reload >/dev/null 2>&1 || true
+echo "Pascaline removed; SUPER + CTRL + Q is back to omacalc."
