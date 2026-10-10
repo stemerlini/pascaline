@@ -8,6 +8,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 BIN="$HOME/.local/bin/pascaline"
 DESKTOP="$HOME/.local/share/applications/pascaline.desktop"
+ICONS="$HOME/.local/share/icons/hicolor"
 HYPR="$HOME/.config/hypr"
 WIDTH="${PASCALINE_WIDTH:-900}"  # window size in pixels; override and rerun to change
 HEIGHT="${PASCALINE_HEIGHT:-440}"
@@ -42,8 +43,12 @@ mkdir -p "$(dirname "$BIN")"
 ln -sfn "$ROOT/pascaline" "$BIN"
 step "Command: $BIN → $ROOT/pascaline"
 
-# 3. Apps-menu entry
-mkdir -p "$(dirname "$DESKTOP")"
+# 3. Icon and apps-menu entry
+mkdir -p "$ICONS/256x256/apps" "$ICONS/512x512/apps" "$ICONS/scalable/apps" "$(dirname "$DESKTOP")"
+cp "$ROOT/assets/icon-256.png" "$ICONS/256x256/apps/pascaline.png"
+cp "$ROOT/assets/icon-512.png" "$ICONS/512x512/apps/pascaline.png"
+cp "$ROOT/assets/icon.svg" "$ICONS/scalable/apps/pascaline.svg"
+gtk-update-icon-cache "$ICONS" &>/dev/null || true
 cat >"$DESKTOP" <<DESKTOP
 [Desktop Entry]
 Version=1.0
@@ -52,7 +57,7 @@ Name=Pascaline
 GenericName=Calculator
 Comment=Notebook-style scientific calculator
 Exec=$LAUNCH
-Icon=accessories-calculator
+Icon=pascaline
 Terminal=false
 Categories=Utility;Calculator;
 Keywords=calculator;math;calc;sympy;notebook;

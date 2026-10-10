@@ -5,6 +5,8 @@ set -euo pipefail
 HYPR="$HOME/.config/hypr"
 [[ -L $HOME/.local/bin/pascaline ]] && rm "$HOME/.local/bin/pascaline"
 rm -f "$HOME/.local/share/applications/pascaline.desktop"
+rm -f "$HOME"/.local/share/icons/hicolor/{256x256,512x512}/apps/pascaline.png \
+      "$HOME/.local/share/icons/hicolor/scalable/apps/pascaline.svg"
 for f in "$HYPR/hyprland.lua" "$HYPR/bindings.lua"; do
   [[ -f $f ]] || continue
   sed -i "/^-- >>> pascaline /,/^-- <<< pascaline$/d" "$f"
