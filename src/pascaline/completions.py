@@ -7,6 +7,9 @@ from dataclasses import dataclass
 import sympy as sp
 
 from .engine import _SYMPY_NAMES, ALIASES, FUNCTIONS
+from .units import CONSTANTS
+
+CONSTANTS_HELP = {name: f"{desc} (constant)" for name, (_, desc) in CONSTANTS.items()}
 
 
 @dataclass(frozen=True)
@@ -120,23 +123,38 @@ def describe(name: str) -> Item:
     return Item(name, "(…)", doc, "func")
 
 
-def complete(word: str, user: dict[str, object], limit: int = 8) -> list[Item]:
-    """Names starting with word: your variables first, then everyday functions, then the rest."""
+# Units worth offering by name; the rest still work when typed.
+COMMON_UNITS = {
+    "km": "kilometre", "cm": "centimetre", "mm": "millimetre", "kg": "kilogram", "hour": "hour (h)",
+    "minute": "minute", "second": "second (s)", "day": "day", "year": "year", "kWh": "kilowatt-hour",
+    "kW": "kilowatt", "kN": "kilonewton", "kPa": "kilopascal", "MPa": "megapascal", "bar": "bar",
+    "atm": "atmosphere", "eV": "electronvolt", "mph": "miles per hour", "kmh": "km per hour",
+    "inch": "inch", "foot": "foot (ft)", "mile": "mile (mi)", "liter": "litre (l)", "kcal": "kilocalorie",
+    "joule": "joule (J)", "newton": "newton", "watt": "watt (W)", "kelvin": "kelvin (K)", "volt": "volt (V)",
+}
+
+
+def complete(word: str, user: dict[str, tuple[str, str]], limit: int = 8) -> list[Item]:
+    """Names starting with word: your variables first, then everyday functions, then the rest.
+    user maps each of your names to (signature, summary), as the kernel reports them."""
     if not word:
         return []
     out: list[Item] = []
-    for name, value in sorted(user.items()):
-        if name.startswith(word) and name != "ans":
-            if isinstance(value, sp.Lambda):
-                sig = "(" + ", ".join(str(v) for v in value.variables) + ")"
-                out.append(Item(name, sig, "your function", "func"))
-            else:
-                out.append(Item(name, "", f"= {sp.sstr(value)}"[:60], "var"))
+    for name, (sig, summary) in sorted(user.items()):
+        if name.startswith(word):
+            out.append(Item(name, sig, summary if sig else f"= {summary}", "func" if sig else "var"))
     seen = {i.name for i in out}
     common = sorted((n for n in _RANK if n.startswith(word) and n not in seen), key=_RANK.get)
+    physics = sorted(n for n in CONSTANTS_HELP if n.startswith(word) and n not in seen)
+    unit_names = sorted(n for n in COMMON_UNITS if n.startswith(word) and n not in seen and n not in _RANK)
     rest = sorted(n for n in MATH_FUNCTIONS if n.startswith(word) and n not in seen and n not in _RANK)
-    for name in common + rest:
+    for name in common + physics + unit_names + rest:
         if len(out) >= limit:
             break
-        out.append(describe(name))
+        if name in CONSTANTS_HELP:
+            out.append(Item(name, "", CONSTANTS_HELP[name], "const"))
+        elif name in COMMON_UNITS:
+            out.append(Item(name, "", "unit: " + COMMON_UNITS[name], "const"))
+        else:
+            out.append(describe(name))
     return out[:limit]

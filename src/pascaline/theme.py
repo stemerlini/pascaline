@@ -10,14 +10,14 @@ from textual.theme import Theme
 COLORS = Path.home() / ".local/state/omarchy/current/theme/colors.toml"
 
 
-def omarchy_theme() -> Theme | None:
+def omarchy_theme(name: str = "omarchy") -> Theme | None:
     try:
         c = tomllib.loads(COLORS.read_text())
     except (OSError, ValueError):
         return None
     try:
         return Theme(
-            name="omarchy",
+            name=name,
             dark=c.get("mode", "dark") != "light",
             primary=c.get("accent") or c["blue"],
             secondary=c.get("magenta"),

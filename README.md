@@ -62,8 +62,20 @@ From a shell: `pascaline '2^64 - 1'` prints one result and exits.
 | `[[1,2],[3,4]]^-1` | matrices; `det`, `inv`, `tr` |
 | `diff`, `integrate`, `limit`, `series`, `factor`, `expand`, `simplify`, `N(pi, 50)` | anything from SymPy |
 | `plot(sin x, cos x, -pi, pi)` | braille sketch of one or more functions |
+| `5 km/h to m/s`, `3 km + 200 m`, `2 kWh to J` | units and conversions |
+| `c0`, `g0`, `G_N`, `h_P`, `hbar`, `k_B`, `N_A`, `q_e`, `m_e`, `m_p`, `eps0`, `mu0`, `R_gas` | physical constants |
 
 Exact answers come with a decimal approximation, like the S⇔D key.
+
+**Units** switch on only for a line that clearly uses them: a ` to ` conversion,
+a constant, or an unmistakable unit such as `km`, `kg` or `hour`. Then every
+unit name counts (`m`, `s`, `h`, `g`…) except your own variables, so `m x + c`
+stays algebra. A number written against a name binds first, as on paper:
+`100 km / 2 hour` is 100 km per 2 hours.
+
+**Calculations run in a kernel**, a separate process like Jupyter's. The window
+never freezes, Esc stops anything that takes too long, and the sheet is rerun so
+your variables come back.
 
 ## Typing
 
@@ -87,16 +99,31 @@ pair removes both.
 | ctrl+y | copy the last result |
 | ctrl+d | toggle DEG / RAD |
 | ctrl+l | clear the view, variables stay (or type `clear`) |
-| ctrl+n | new sheet, forget everything |
+| ctrl+n | empty this sheet |
+| ctrl+o | switch sheet, or type a new name to make one |
+| esc | stop a running calculation |
 | ? / F1 | help |
 | esc | clear input, or quit when empty |
 
-Commands: `clear`, `:deg`, `:rad`, `:digits 20`, `:vars`, `:new`, `:q`.
+Commands: `clear`, `:deg`, `:rad`, `:digits 20`, `:vars`, `:new`, `:latex`, `:q`.
+
+## Sheets and export
+
+Each sheet has its own cells and variables; Pascaline reopens the last one.
+`:sheet NAME` switches (or creates), `:rename NAME` and `:delete NAME` tidy up.
+
+- `:latex`, or `l` on a selected cell, copies a result as LaTeX.
+- `:export md [path]` writes the sheet as Markdown, with LaTeX for each result.
+- `:export ipynb [path]` writes a Jupyter notebook that reruns in plain SymPy.
+
+Exports go to `data/exports/` unless you give a path.
+
+The colours follow the Omarchy theme, also when you switch themes with the app open.
 
 ## Data
 
-Everything stays in this folder: `data/history.txt` (every line you evaluated)
-and `data/sheet.json` (the current sheet). Set `PASCALINE_DATA` to keep them elsewhere.
+Everything stays in this folder: `data/history.txt` (every line you evaluated),
+`data/sheets/*.json` (your sheets) and `data/exports/`. Set `PASCALINE_DATA` to keep them elsewhere.
 
 ## Development
 

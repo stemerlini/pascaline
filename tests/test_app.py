@@ -8,7 +8,9 @@ from pascaline.app import Pascaline
 def data(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "DATA", tmp_path)
     monkeypatch.setattr(store, "HISTORY", tmp_path / "history.txt")
-    monkeypatch.setattr(store, "SHEET", tmp_path / "sheet.json")
+    monkeypatch.setattr(store, "SHEETS", tmp_path / "sheets")
+    monkeypatch.setattr(store, "STATE", tmp_path / "state.json")
+    monkeypatch.setattr(store, "EXPORTS", tmp_path / "exports")
     return tmp_path
 
 
@@ -193,3 +195,87 @@ async def test_graph_panel_is_square():
         await type_line(app, pilot, "plot(x^2, -2, 2)")
         assert not app.graph.display
         assert "⠀" in app.cells[0].render().plain or "━" in app.cells[0].render().plain
+
+
+async def test_escape_stops_a_slow_cell():
+    app = Pascaline()
+    async with app.run_test() as pilot:
+        await type_line(app, pilot, "a = 3")
+        app.input.value = "nextprime(10^4000)"
+        await pilot.press("enter")
+        await pilot.pause(0.6)
+        assert app.kernel.busy
+        await pilot.press("escape")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app.input.value == "nextprime(10^4000)"  # given back to edit
+        assert [c.src for c in app.cells] == ["a = 3"]
+        app.input.value = ""
+        await type_line(app, pilot, "a * 2")  # the sheet was rerun: a is back
+        assert app.cells[-1].result.text == "6"
+
+
+async def test_sheets(data):
+    app = Pascaline()
+    async with app.run_test() as pilot:
+        await type_line(app, pilot, "a = 1")
+        await type_line(app, pilot, ":sheet physics")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app.sheet_name == "physics" and app.cells == []
+        await type_line(app, pilot, "a")
+        assert app.cells[-1].result.text == "a"  # sheets don't share variables
+        await type_line(app, pilot, ":sheet main")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert [c.src for c in app.cells] == ["a = 1"]
+        await type_line(app, pilot, ":rename work")
+        assert app.sheet_name == "work"
+    assert sorted(p.stem for p in (data / "sheets").glob("*.json")) == ["physics", "work"]
+    app = Pascaline()  # reopens on the last sheet
+    async with app.run_test() as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app.sheet_name == "work" and [c.src for c in app.cells] == ["a = 1"]
+
+
+async def test_sheet_picker_creates(data):
+    app = Pascaline()
+    async with app.run_test() as pilot:
+        await pilot.press("ctrl+o")
+        await pilot.press(*"lab", "enter")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert app.sheet_name == "lab"
+
+
+async def test_export(data):
+    import json
+
+    app = Pascaline()
+    async with app.run_test() as pilot:
+        for line in ("a = 3/4", "x^2 = 2", "plot(sin x)"):
+            await type_line(app, pilot, line)
+        await type_line(app, pilot, f":export md {data / 'out.md'}")
+        await type_line(app, pilot, f":export ipynb {data / 'out'}")
+    md = (data / "out.md").read_text()
+    assert "**[1]** `a = 3/4`" in md and r"\sqrt{2}" in md
+    nb = json.loads((data / "out.ipynb").read_text())
+    assert nb["nbformat"] == 4 and any('a = _1 = calc("3/4")' in "".join(c["source"]) for c in nb["cells"])
+
+
+async def test_theme_follows_omarchy(tmp_path, monkeypatch):
+    from pascaline import app as app_module
+
+    colors = tmp_path / "colors.toml"
+    colors.write_text('background = "#000000"\nforeground = "#ffffff"\nblue = "#0000ff"\n')
+    monkeypatch.setattr(app_module, "COLORS", colors)
+    monkeypatch.setattr("pascaline.theme.COLORS", colors)
+    app = Pascaline()
+    async with app.run_test() as pilot:
+        first = app.theme
+        assert first.startswith("omarchy")
+        colors.write_text('background = "#ffffff"\nforeground = "#000000"\nblue = "#ff0000"\n')
+        app.apply_omarchy_theme()
+        await pilot.pause()
+        assert app.theme != first and app.current_theme.background == "#ffffff"

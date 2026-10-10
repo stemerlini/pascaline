@@ -12,6 +12,7 @@ Syntax on top of SymPy:
 
 from __future__ import annotations
 
+import contextlib
 import re
 import threading
 import warnings
@@ -27,6 +28,8 @@ from sympy.parsing.sympy_parser import (
     standard_transformations,
 )
 
+from . import units
+
 warnings.filterwarnings("ignore", module="sympy")
 warnings.filterwarnings("ignore", message=".*non-Expr.*")
 
@@ -35,6 +38,11 @@ TRANSFORMS = standard_transformations + (convert_xor, implicit_multiplication, i
 IDENT = r"[A-Za-z_][A-Za-z0-9_]*"
 ASSIGN_RE = re.compile(rf"^\s*({IDENT})\s*=(?!=)(.*)$", re.S)
 FUNCDEF_RE = re.compile(rf"^\s*({IDENT})\s*\(\s*({IDENT}(?:\s*,\s*{IDENT})*)\s*\)\s*=(?!=)(.*)$", re.S)
+
+# A number written against a name binds tighter than / and *, like on paper:
+# 100 km / 2 hour is 100 km / (2 hour), and 1/2x is 1/(2x).
+TIGHT_RE = re.compile(r"(?<![\w.])((?>\d+(?:\.\d+)?(?:[eE][+-]?\d+)?))\s*([A-Za-z_]\w*(?:\^-?\d+)?)(?![\w(])")
+HEX_RE = re.compile(r"(?<![\w.])0[xXbBoO][0-9a-fA-F]")
 
 UNICODE = {
     "×": "*", "·": "*", "÷": "/", "−": "-", "π": "pi", "√": "sqrt ", "∞": "oo",
@@ -124,6 +132,7 @@ class Result:
     value: object = None
     plot: Plot | None = None
     inline: str | None = None  # one-line form, when the pretty one spans lines
+    latex: str | None = None
 
     @property
     def copy_text(self) -> str:
@@ -199,18 +208,22 @@ class Engine:
             if commit:
                 self.vars[name] = fn
             shown = sp.Eq(sp.Function(name)(*syms), expr, evaluate=False)
-            return Result("assign", self.pretty(shown), value=None)
+            return Result("assign", self.pretty(shown), value=None, latex=sp.latex(shown))
         if (m := ASSIGN_RE.match(src)) and _top_level_eq(src) == [m.start(2) - 1]:
             name, body = m.group(1), m.group(2)
-            if name in ("pi", "E", "I", "oo", "e", "i"):
+            if name in ("pi", "oo", "e", "i"):  # E and I stay free: E for energy, I for current
                 raise MathError(f"{name} is a constant")
             value = self.parse(body)
             if commit:
                 self.vars[name] = value
             res = self.describe(value)
             res.kind = "assign"
-            res.text = self.pretty(sp.Eq(sp.Symbol(name), value, evaluate=False)) if _is_expr(value) \
-                else f"{name} = {res.text}"
+            if _is_expr(value) and not units.has_units(value):
+                res.text = self.pretty(sp.Eq(sp.Symbol(name), value, evaluate=False))
+            else:
+                res.text = f"{name} = {res.text}"
+            if res.latex:
+                res.latex = f"{sp.latex(sp.Symbol(name))} = {res.latex}"
             return res
         if _top_level_eq(src):
             return self.solve(src)
@@ -228,13 +241,25 @@ class Engine:
     def parse(self, src: str, extra: dict | None = None):
         if not src.strip():
             raise MathError("missing expression")
+        body, target_src = units.split_target(src)
         local = dict(self.vars)
         if extra:
             local.update(extra)
-        src = _wrap_matrices(src)
+        local = {**units.bindings(src, set(local), explicit=target_src is not None), **local}
+        body = _wrap_matrices(body)
         ns = self.namespace()
-        _guard(src, local, ns)
-        value = parse_expr(src, local_dict=local, global_dict=ns, transformations=TRANSFORMS)
+        _guard(body, local, ns)
+        value = parse_expr(body, local_dict=local, global_dict=ns, transformations=TRANSFORMS)
+        if target_src is not None:
+            if not target_src:
+                raise MathError("convert to what? e.g. 5 km/h to m/s")
+            target = parse_expr(target_src, local_dict=local, global_dict=ns, transformations=TRANSFORMS)
+            try:
+                value = units.convert(value, target)
+            except ValueError as exc:
+                raise MathError(str(exc)) from None
+        elif units.has_units(value):
+            value = units.convert(value, src=body, skip=frozenset(self.vars) | frozenset(extra or ()))
         if isinstance(value, (list, tuple)) and value and all(isinstance(r, (list, tuple)) for r in value):
             value = sp.Matrix(value)
         elif isinstance(value, bool):
@@ -308,7 +333,9 @@ class Engine:
             else ", ".join(f"{k} ≈ {fmt_number(v, self.digits)}" for k, v in sol.items())
             for sol in sols
         )
-        return Result("solve", "\n".join(lines), "\n".join(approx) or None, value=value, inline=inline)
+        latex = r", \quad ".join(sp.latex(sp.Eq(k, v)) for sol in sols for k, v in sol.items())
+        return Result("solve", "\n".join(lines), "\n".join(approx) or None, value=value, inline=inline,
+                      latex=latex)
 
     # -- formatting --------------------------------------------------------
 
@@ -324,6 +351,28 @@ class Engine:
                 return Result("value", str(value), value=None)
         if value in (sp.zoo, sp.nan):
             raise MathError("undefined (division by zero?)")
+        res = self._describe(value)
+        if res.latex is None and res.value is not None:
+            with contextlib.suppress(Exception):
+                res.latex = sp.latex(res.value)
+        return res
+
+    def _describe(self, value) -> Result:
+        if units.has_units(value):
+            num, unit = units.split(value)
+            if num * unit != value:  # mixed sums that don't share units
+                return Result("value", self.pretty(value), value=value)
+            shown = units.show(unit)
+            approx = None
+            if num.is_Float or (num.is_Rational and num.q > 100):  # 96.56 km/h, not 301752/3125
+                text = fmt_number(num, self.digits)
+            elif num.is_Integer:
+                text = str(num)
+            else:
+                text = _sstr(num)
+                if num.is_number:
+                    approx = f"{fmt_number(num, self.digits)} {shown}"
+            return Result("value", f"{text} {shown}", approx, value)
         if value in (sp.true, sp.false):
             return Result("value", "true" if value is sp.true else "false", value=value)
         approx = None
@@ -391,6 +440,8 @@ def normalize(src: str) -> str:
         src = src.replace(k, v)
     if src.endswith("=") and not src.endswith("=="):
         src = src[:-1].rstrip()  # Casio habit: "2+3="
+    if not HEX_RE.search(src):
+        src = TIGHT_RE.sub(r"(\1*\2)", src)
     return src
 
 

@@ -7,6 +7,8 @@ import shutil
 import struct
 import subprocess
 import sys
+import threading
+from pathlib import Path
 
 import sympy as sp
 from rich.text import Text
@@ -18,12 +20,15 @@ from textual.screen import ModalScreen
 from textual.widgets import Input, Label, OptionList, Static
 from textual.widgets.option_list import Option
 
-from . import __version__, store
+from . import __version__, export, store
 from .completions import Item, complete
-from .engine import FUNCTIONS, Engine, Plot, Result
+from .engine import FUNCTIONS, Plot, Result
+from .kernel import Interrupted, Kernel, Reply
 from .plot import GUTTER
 from .plot import render as render_plot
-from .theme import omarchy_theme
+from .theme import COLORS, omarchy_theme
+
+PREVIEW_TIMEOUT = 3.0  # seconds a live preview may take before it gives up
 
 TOKEN_RE = re.compile(r"(?P<num>\d+\.?\d*(?:e[+-]?\d+)?)|(?P<name>[A-Za-z_]\w*)|(?P<op>[-+*/^!=<>%])|(?P<other>.)")
 
@@ -42,6 +47,8 @@ HELP = """\
   diff(f(x), x)  integrate(x^2, (x, 0, 1))  limit(sin(x)/x, x, 0)
   series(e^x, x, 0, 5)  factor  expand  simplify  nCr  gcd  N(pi, 50)
   plot(sin x, cos x, -pi, pi)   sketch; plot(f, (t, 0, 10))
+  5 km/h to m/s  3 km + 200 m  2 kWh to J   units (switch on when you use one)
+  c0 g0 G_N h_P hbar k_B N_A q_e m_e m_p eps0 mu0 R_gas   physical constants
 
 [b]Keys[/b]
   ⏎        evaluate (live preview while you type)
@@ -49,13 +56,15 @@ HELP = """\
   tab      accept completion (↑↓ pick, then ⏎ works too)
   ( [ {    close themselves; select text and type ( to wrap it
   ctrl+y   copy last result
-  ctrl+↑   select cells: ⏎ edit · d delete · y copy · i insert _n · esc back
-  ctrl+l   clear the view (variables stay)   ctrl+n  new sheet (forget all)
-  ctrl+d   toggle DEG / RAD
-  esc      clear input, or quit when empty
+  ctrl+↑   select cells: ⏎ edit · d delete · y copy · l copy LaTeX · i insert _n · esc back
+  ctrl+l   clear the view (variables stay)   ctrl+n  empty this sheet
+  ctrl+o   switch sheet / make a new one     ctrl+d  toggle DEG / RAD
+  esc      stop a running calculation, clear input, or quit when empty
 
 [b]Commands[/b]
-  clear  :deg  :rad  :digits 20  :vars  :new  :q
+  clear  :deg  :rad  :digits 20  :vars  :new  :latex  :q
+  :sheet NAME  :sheets  :rename NAME  :delete NAME
+  :export md [path]   :export ipynb [path]   (default: data/exports/)
 """
 
 
@@ -298,6 +307,7 @@ class Sheet(VerticalScroll, can_focus=True):
         Binding("enter,e", "app.edit_cell", show=False),
         Binding("d,delete", "app.delete_cell", show=False),
         Binding("y", "app.copy_cell", show=False),
+        Binding("l", "app.copy_cell_latex", show=False),
         Binding("i", "app.insert_ref", show=False),
         Binding("escape", "app.leave_cells", show=False),
     ]
@@ -306,29 +316,38 @@ class Sheet(VerticalScroll, can_focus=True):
         self.app.move_selection(step)
 
 
-class HistoryScreen(ModalScreen[str | None]):
+class PickerScreen(ModalScreen[str | None]):
+    """A filterable list: history search, sheet switcher."""
+
     BINDINGS = [Binding("escape", "dismiss(None)", show=False)]
 
-    def __init__(self, history: list[str]):
+    def __init__(self, items: list[tuple[str, str]], placeholder: str, create: str | None = None):
         super().__init__()
-        seen, self.items = set(), []
-        for line in reversed(history):
-            if line not in seen:
-                seen.add(line)
-                self.items.append(line)
+        self.items = items  # (value, label)
+        self.placeholder = placeholder
+        self.create = create  # e.g. "new sheet": typing a new name offers to create it
 
     def compose(self) -> ComposeResult:
         with Vertical(id="history-box"):
-            yield Input(placeholder="search history…", id="history-filter")
-            yield OptionList(*self.items[:500], id="history-list")
+            yield Input(placeholder=self.placeholder, id="history-filter")
+            yield OptionList(id="history-list")
+
+    def on_mount(self) -> None:
+        self.fill("")
+
+    def fill(self, query: str) -> None:
+        q = query.strip()
+        ol = self.query_one(OptionList)
+        ol.clear_options()
+        options = [Option(label, id=f"v:{value}") for value, label in self.items if q.lower() in label.lower()]
+        if self.create and q and all(value != q for value, _ in self.items):
+            options.insert(0, Option(f"+ {self.create} “{q}”", id=f"v:{q}"))
+        ol.add_options(options[:500])
+        ol.highlighted = 0 if ol.option_count else None
 
     @on(Input.Changed, "#history-filter")
     def filter(self, event: Input.Changed) -> None:
-        q = event.value.lower()
-        ol = self.query_one(OptionList)
-        ol.clear_options()
-        ol.add_options([s for s in self.items if q in s.lower()][:500])
-        ol.highlighted = 0 if ol.option_count else None
+        self.fill(event.value)
 
     def on_key(self, event) -> None:
         ol = self.query_one(OptionList)
@@ -340,11 +359,20 @@ class HistoryScreen(ModalScreen[str | None]):
     def pick_from_filter(self) -> None:
         ol = self.query_one(OptionList)
         if ol.highlighted is not None:
-            self.dismiss(str(ol.get_option_at_index(ol.highlighted).prompt))
+            self.dismiss(ol.get_option_at_index(ol.highlighted).id[2:])
 
     @on(OptionList.OptionSelected)
     def pick(self, event: OptionList.OptionSelected) -> None:
-        self.dismiss(str(event.option.prompt))
+        self.dismiss(event.option.id[2:])
+
+
+def history_items(history: list[str]) -> list[tuple[str, str]]:
+    seen, out = set(), []
+    for line in reversed(history):
+        if line not in seen:
+            seen.add(line)
+            out.append((line, line))
+    return out
 
 
 class HelpScreen(ModalScreen[None]):
@@ -364,6 +392,7 @@ class Pascaline(App):
         Binding("ctrl+y", "copy_last", show=False, priority=True),
         Binding("ctrl+l", "clear_view", show=False, priority=True),
         Binding("ctrl+n", "new_sheet", show=False, priority=True),
+        Binding("ctrl+o", "pick_sheet", show=False, priority=True),
         Binding("ctrl+d", "toggle_angle", show=False, priority=True),
         Binding("ctrl+up", "enter_cells", show=False, priority=True),
         Binding("f1", "help", show=False),
@@ -371,9 +400,18 @@ class Pascaline(App):
 
     def __init__(self):
         super().__init__()
-        sheet = store.load_sheet()
-        self.engine = Engine(digits=int(sheet.get("digits", 12)), degrees=bool(sheet.get("degrees", False)))
+        self.sheet_name = store.current_sheet()
+        sheet = store.load_sheet(self.sheet_name)
+        self.digits = int(sheet.get("digits", 12))
+        self.degrees = bool(sheet.get("degrees", False))
         self.saved_cells = store.sheet_cells(sheet)
+        self.kernel = Kernel(self.digits, self.degrees)  # runs the sheet
+        self.preview_kernel = Kernel(self.digits, self.degrees)  # runs live previews, may be killed any time
+        self._preview_lock = threading.Lock()
+        self._preview_state: tuple[list[str], int, bool] | None = ([], self.digits, self.degrees)
+        self.names: dict[str, tuple[str, str]] = {}  # your variables, as the kernel last reported them
+        self._pending = 0  # cells submitted but not back yet
+        self._theme_stamp = ""
         self.history = store.load_history()
         self.hist_pos: int | None = None
         self.draft = ""
@@ -405,12 +443,9 @@ class Pascaline(App):
         yield Static("", id="status")
 
     def on_mount(self) -> None:
-        theme = omarchy_theme()
-        if theme:
-            self.register_theme(theme)
-            self.theme = "omarchy"
-        else:
+        if not self.apply_omarchy_theme():
             self.theme = "tokyo-night"
+        self.set_interval(2, self.apply_omarchy_theme)
         self.menu.hide()
         self.graph.aspect = cell_aspect()
         self.layout_panes()
@@ -418,6 +453,35 @@ class Pascaline(App):
         self.update_status()
         if self.saved_cells:
             self.recompute([c for c, _ in self.saved_cells], [h for _, h in self.saved_cells])
+
+    def apply_omarchy_theme(self) -> bool:
+        """Follow the Omarchy theme, also when it changes while the app is open."""
+        try:
+            stamp = COLORS.read_text()
+        except OSError:
+            return False
+        if stamp == self._theme_stamp:
+            return True
+        self._theme_stamp = stamp
+        name = f"omarchy-{abs(hash(stamp)) % 10**8}"
+        theme = omarchy_theme(name)
+        if not theme:
+            return False
+        self.register_theme(theme)
+        self.theme = name
+        self.refresh_cells()
+        return True
+
+    def refresh_cells(self) -> None:
+        if not self.is_mounted:
+            return
+        for cell in self.all_cells:
+            cell.refresh()
+        self.graph.refresh()
+
+    def on_unmount(self) -> None:
+        self.kernel.close()
+        self.preview_kernel.close()
 
     @property
     def input(self) -> MathInput:
@@ -473,8 +537,7 @@ class Pascaline(App):
         before = self.input.value[: self.input.cursor_position]
         m = WORD_BEFORE.search(before)
         word = m.group() if m and not before[: m.start()].endswith(".") else ""
-        user = {n: self.engine.vars[n] for n in self.engine.user_names()}
-        items = complete(word, user) if len(word) >= 2 else []
+        items = complete(word, self.names) if len(word) >= 2 else []
         if not items or (len(items) == 1 and items[0].name == word):
             self.menu.hide()
         else:
@@ -520,13 +583,14 @@ class Pascaline(App):
         self.input.focus()
 
     def update_status(self) -> None:
-        e = self.engine
-        mode = "DEG" if e.degrees else "RAD"
+        mode = "DEG" if self.degrees else "RAD"
         n = len(self.cells)
-        left = f" {mode} · {e.digits} sig · {n} cell{'s' * (n != 1)}"
+        left = f" {self.sheet_name} · {mode} · {self.digits} sig · {n} cell{'s' * (n != 1)}"
+        if self.kernel.busy:
+            left += " · computing (esc stops)"
         if self.editing:
             left += f" · editing [{self.editing.n}]"
-        right = "⏎ eval  ↑↓ hist  ^R search  ^↑ cells  ^Y copy  ^L clear  ? help "
+        right = "⏎ eval  ^R search  ^↑ cells  ^Y copy  ^L clear  ^O sheets  ? help "
         width = self.size.width or 80
         self.query_one("#status", Static).update(
             Text(left) + Text(" " * max(1, width - len(left) - len(right))) + Text(right)
@@ -550,7 +614,7 @@ class Pascaline(App):
         self.input.value = ""
         self.set_preview("")
         self.menu.hide()
-        if src in ("?", "help", "clear", "cls") or src.startswith(":"):
+        if src in ("?", "help", "clear", "cls") or (src.startswith(":") and src[1:2].isalpha()):
             self.command(src)
             return
         if self.editing:
@@ -559,16 +623,38 @@ class Pascaline(App):
             srcs = [c.src if c is not target else src for c in self.all_cells]
             self.recompute(srcs)
         else:
-            self.evaluate(src, len(self.all_cells) + 1)
+            n = len(self.all_cells) + 1 + self._pending
+            self._pending += 1
+            self.evaluate(src, n)
 
-    @work(thread=True, exclusive=True, group="eval")
+    @work(thread=True, group="eval")
     def evaluate(self, src: str, n: int) -> None:
-        self.call_from_thread(self.set_preview, "⋯ computing")
-        with self.engine.lock:
-            result = self.engine.run(src, n)
-        self.call_from_thread(self.add_cell, n, src, result)
+        self.call_from_thread(self.computing)
+        try:
+            reply = self.kernel.call("run", src, n, True)
+        except Interrupted as exc:
+            self.call_from_thread(self.eval_stopped, src, str(exc))
+            return
+        self.call_from_thread(self.add_cell, n, src, reply)
 
-    def add_cell(self, n: int, src: str, result: Result) -> None:
+    def computing(self) -> None:
+        self.set_preview(Text("  ⋯ computing — esc to stop", style=f"{self.current_theme.warning} italic"))
+        self.update_status()
+
+    def eval_stopped(self, src: str, why: str) -> None:
+        """The kernel was restarted empty: rerun the sheet without the line that was stopped."""
+        self._pending = max(0, self._pending - 1)
+        self.set_preview("")
+        if not self.input.value:
+            self.input.value = src
+            self.input.cursor_position = len(src)
+        self.notify(f"{why}; the sheet is being rerun", severity="warning", timeout=3)
+        self.recompute([c.src for c in self.all_cells])
+
+    def add_cell(self, n: int, src: str, reply: Reply) -> None:
+        self._pending = max(0, self._pending - 1)
+        self.names = reply.names
+        result = reply.results[0]
         self.set_preview("")
         if result.kind == "plot":
             self.graph.show(result.plot, f"[{n}] {src}")
@@ -578,15 +664,21 @@ class Pascaline(App):
         self.sheet.scroll_end(animate=False)
         self.after_change()
 
-    @work(thread=True, exclusive=True, group="eval")
+    @work(thread=True, group="eval")
     def recompute(self, srcs: list[str], hidden: list[bool] | None = None) -> None:
         """Rerun the whole sheet from scratch, top to bottom, like 'Run all'."""
-        with self.engine.lock:
-            self.engine.reset()
-            results = [self.engine.run(s, k + 1) for k, s in enumerate(srcs)]
-        self.call_from_thread(self.show_all, srcs, results, hidden)
+        self.call_from_thread(self.update_status)
+        try:
+            self.kernel.configure(self.digits, self.degrees)
+            reply = self.kernel.call("run_all", srcs)
+        except Interrupted as exc:
+            stopped = Result("error", f"not run: {exc}. Edit a cell to rerun the sheet")
+            reply = Reply([stopped] * len(srcs))
+        self.call_from_thread(self.show_all, srcs, reply, hidden)
 
-    def show_all(self, srcs: list[str], results: list[Result], hidden: list[bool] | None = None) -> None:
+    def show_all(self, srcs: list[str], reply: Reply, hidden: list[bool] | None = None) -> None:
+        results = reply.results
+        self.names = reply.names
         cells = self.all_cells
         for k, (src, res) in enumerate(zip(srcs, results, strict=True)):
             if k < len(cells):
@@ -611,7 +703,7 @@ class Pascaline(App):
 
     def after_change(self) -> None:
         cells = [(c.src, c.hidden) for c in self.all_cells]
-        store.save_sheet(cells, self.engine.degrees, self.engine.digits)
+        store.save_sheet(self.sheet_name, cells, self.degrees, self.digits)
         self.update_status()
 
     # -- live preview ------------------------------------------------------
@@ -625,19 +717,39 @@ class Pascaline(App):
             self.graph.show_preview(None)
             return
         self._preview_src = src
-        self.set_timer(0.05, lambda: self.preview(src))
+        state = ([c.src for c in self.all_cells], self.digits, self.degrees)
+        self.set_timer(0.05, lambda: self.preview(src, state))
 
-    @work(thread=True, exclusive=True, group="preview")
-    def preview(self, src: str) -> None:
-        if src != self._preview_src:
-            return
-        if not self.engine.lock.acquire(blocking=False):
-            return
-        try:
-            res = self.engine.run(src, commit=False)
-        finally:
-            self.engine.lock.release()
-        self.call_from_thread(self.show_preview, src, res)
+    @work(thread=True, group="preview")
+    def preview(self, src: str, state: tuple[list[str], int, bool]) -> None:
+        with self._preview_lock:
+            if src != self._preview_src:
+                return  # typing moved on
+            k = self.preview_kernel
+            try:
+                self._sync_preview_kernel(state)
+                reply = k.call("run", src, None, False, timeout=PREVIEW_TIMEOUT)
+            except Interrupted:
+                self._preview_state = None  # restarted empty; resync next time
+                self.call_from_thread(self.preview_gave_up, src)
+                return
+        self.call_from_thread(self.show_preview, src, reply.results[0])
+
+    def _sync_preview_kernel(self, state: tuple[list[str], int, bool]) -> None:
+        """Bring the preview kernel to the sheet's state, running only what's new."""
+        srcs, digits, degrees = state
+        k, have = self.preview_kernel, self._preview_state
+        if have and have[1:] == (digits, degrees) and srcs[: len(have[0])] == have[0]:
+            for i, s in enumerate(srcs[len(have[0]) :], start=len(have[0]) + 1):
+                k.call("run", s, i, True)
+        else:
+            k.configure(digits, degrees)
+            k.call("run_all", srcs)
+        self._preview_state = (list(srcs), digits, degrees)
+
+    def preview_gave_up(self, src: str) -> None:
+        if src == self.input.value.strip():
+            self.set_preview(Text("  … too slow to preview; ⏎ computes it (esc stops)", style="dim italic"))
 
     def show_preview(self, src: str, res: Result) -> None:
         if src != self.input.value.strip():
@@ -681,7 +793,7 @@ class Pascaline(App):
                 self.input.cursor_position = len(line)
             self.input.focus()
 
-        self.push_screen(HistoryScreen(self.history), chosen)
+        self.push_screen(PickerScreen(history_items(self.history), "search history…"), chosen)
 
     # -- cell selection ----------------------------------------------------
 
@@ -744,6 +856,10 @@ class Pascaline(App):
         if self.selected:
             self.copy(self.selected.result)
 
+    def action_copy_cell_latex(self) -> None:
+        if self.selected:
+            self.copy(self.selected.result, latex=True)
+
     def action_insert_ref(self) -> None:
         if not self.selected:
             return
@@ -754,7 +870,9 @@ class Pascaline(App):
     # -- misc actions ------------------------------------------------------
 
     def action_escape(self) -> None:
-        if self.menu.display:
+        if self.kernel.busy:
+            self.kernel.interrupt()
+        elif self.menu.display:
             self.menu.hide()
         elif self.editing:
             self.editing = None
@@ -767,18 +885,21 @@ class Pascaline(App):
         else:
             self.exit()
 
-    def action_copy_last(self) -> None:
+    def action_copy_last(self, latex: bool = False) -> None:
         for cell in reversed(self.cells):
             if cell.result.kind not in ("error", "plot"):
-                self.copy(cell.result)
+                self.copy(cell.result, latex)
                 return
         self.notify("nothing to copy", severity="warning")
 
-    def copy(self, result: Result) -> None:
-        text = result.copy_text
+    def copy(self, result: Result, latex: bool = False) -> None:
+        text = result.latex if latex else result.copy_text
         if result.kind in ("error", "plot") or not text:
             self.notify("nothing to copy", severity="warning")
             return
+        self.to_clipboard(text)
+
+    def to_clipboard(self, text: str) -> None:
         if shutil.which("wl-copy"):
             subprocess.run(["wl-copy", "--", text], check=False)
         else:
@@ -797,18 +918,102 @@ class Pascaline(App):
         """Start over: cells and variables both go."""
         self.graph.show(None)
         for cell in self.all_cells:
+            cell.deleted = True
             cell.remove()
         self.select(None)
         self.editing = None
         self.input.remove_class("-editing")
-        with self.engine.lock:
-            self.engine.reset()
-        self.call_after_refresh(self.after_change)
+        self.recompute([])
 
     def action_toggle_angle(self) -> None:
-        self.engine.degrees = not self.engine.degrees
-        self.notify("degrees" if self.engine.degrees else "radians", timeout=1.5)
+        self.degrees = not self.degrees
+        self.notify("degrees" if self.degrees else "radians", timeout=1.5)
         self.recompute([c.src for c in self.all_cells])
+
+    # -- sheets ------------------------------------------------------------
+
+    def action_pick_sheet(self) -> None:
+        def label(name: str) -> str:
+            n = len(store.sheet_cells(store.load_sheet(name)))
+            mark = "● " if name == self.sheet_name else "  "
+            return f"{mark}{name}  ({n} cell{'s' * (n != 1)})"
+
+        names = store.list_sheets()
+        if self.sheet_name not in names:
+            names.insert(0, self.sheet_name)
+
+        def chosen(name: str | None) -> None:
+            self.input.focus()
+            if name:
+                self.open_sheet(name)
+
+        self.push_screen(PickerScreen([(n, label(n)) for n in names], "sheet name…", create="new sheet"), chosen)
+
+    def open_sheet(self, name: str) -> None:
+        if not store.valid_name(name):
+            self.notify("sheet names: letters, digits, space . _ + -", severity="warning")
+            return
+        if name == self.sheet_name:
+            return
+        self.after_change()  # save the one we leave
+        data = store.load_sheet(name)
+        self.sheet_name = name
+        store.set_current_sheet(name)
+        self.digits = int(data.get("digits", 12))
+        self.degrees = bool(data.get("degrees", False))
+        for cell in self.all_cells:
+            cell.deleted = True
+            cell.remove()
+        self.select(None)
+        self.editing = None
+        self.input.remove_class("-editing")
+        self.graph.show(None)
+        cells = store.sheet_cells(data)
+        self.recompute([c for c, _ in cells], [h for _, h in cells])
+        self.notify(f"sheet {name}" + ("" if cells else " (new)"), timeout=1.5)
+
+    def rename_sheet(self, new: str) -> None:
+        if not store.valid_name(new):
+            self.notify("usage: :rename NEW-NAME", severity="warning")
+            return
+        try:
+            self.after_change()
+            store.rename_sheet(self.sheet_name, new)
+        except FileExistsError:
+            self.notify(f"there is already a sheet {new}", severity="warning")
+            return
+        self.sheet_name = new
+        store.set_current_sheet(new)
+        self.update_status()
+
+    def delete_sheet(self, name: str) -> None:
+        if not name or name not in store.list_sheets():
+            self.notify("usage: :delete NAME (an existing sheet)", severity="warning")
+        elif name == self.sheet_name:
+            self.notify("switch to another sheet first (ctrl+o)", severity="warning")
+        else:
+            store.delete_sheet(name)
+            self.notify(f"deleted sheet {name}")
+
+    # -- export ------------------------------------------------------------
+
+    def export(self, arg: str) -> None:
+        kind, _, path = arg.partition(" ")
+        kind = kind or "md"
+        if kind not in ("md", "markdown", "ipynb", "notebook", "jupyter"):
+            self.notify("usage: :export md [path]  or  :export ipynb [path]", severity="warning")
+            return
+        ext = "md" if kind in ("md", "markdown") else "ipynb"
+        cells = [(c.n, c.src, c.result) for c in self.all_cells]
+        if not cells:
+            self.notify("nothing to export", severity="warning")
+            return
+        text = export.to_markdown(self.sheet_name, cells) if ext == "md" else export.to_notebook(self.sheet_name, cells)
+        target = Path(path.strip()) if path.strip() else export.default_path(self.sheet_name, ext)
+        if target.suffix != f".{ext}":
+            target = target / f"{self.sheet_name}.{ext}" if target.is_dir() else target.with_suffix(f".{ext}")
+        written = export.write(target, text)
+        self.notify(f"saved {written}", title="export", timeout=6)
 
     def action_help(self) -> None:
         self.push_screen(HelpScreen())
@@ -818,22 +1023,34 @@ class Pascaline(App):
         if cmd in ("?", "help", "h"):
             self.action_help()
         elif cmd in ("deg", "rad"):
-            if self.engine.degrees != (cmd == "deg"):
+            if self.degrees != (cmd == "deg"):
                 self.action_toggle_angle()
         elif cmd in ("digits", "sig", "fix"):
             if not arg.strip().isdigit() or not 1 <= int(arg) <= 1000:
                 self.notify("usage: :digits 1-1000", severity="warning")
                 return
-            self.engine.digits = int(arg)
+            self.digits = int(arg)
             self.recompute([c.src for c in self.all_cells])
         elif cmd == "vars":
-            names = self.engine.user_names()
-            body = "\n".join(f"{n} = {sp.sstr(self.engine.vars[n])}"[:80] for n in names) or "no variables"
+            body = "\n".join(f"{n}{sig} = {summary}"[:80] if not sig else f"{n}{sig}"
+                             for n, (sig, summary) in sorted(self.names.items())) or "no variables"
             self.notify(body, title="variables", timeout=8)
         elif cmd in ("clear", "cls"):
             self.action_clear_view()
         elif cmd in ("new", "reset"):
             self.action_new_sheet()
+        elif cmd == "latex":
+            self.action_copy_last(latex=True)
+        elif cmd == "export":
+            self.export(arg.strip())
+        elif cmd == "sheet":
+            self.open_sheet(arg.strip()) if arg.strip() else self.action_pick_sheet()
+        elif cmd == "sheets":
+            self.action_pick_sheet()
+        elif cmd == "rename":
+            self.rename_sheet(arg.strip())
+        elif cmd == "delete":
+            self.delete_sheet(arg.strip())
         elif cmd in ("q", "quit", "exit"):
             self.exit()
         else:
